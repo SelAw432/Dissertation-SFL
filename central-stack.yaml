@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Global Shared Resources for Federated Learning Framework'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix
+    Type: String
+    Default: fedlearn
+  
+Resources:
+  # Central Model Storage Bucket
+  CentralModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: fl-modelbucket
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Lifecycle configuration to manage old model versions
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldModelVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ArchiveOldModels
+            Status: Enabled
+            Prefix: 'models/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: fl-modelbucket
+        - Key: Purpose
+          Value: 'Federated Learning Central Model Storage'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # DynamoDB Table for Aggregation Queue
+  AggregationQueueTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub fl-aggregationqueue
+      AttributeDefinitions:
+        - AttributeName: region
+          AttributeType: S
+      KeySchema:
+        - AttributeName: region
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub AggregationQueue
+        - Key: Purpose
+          Value: 'Coordinator for federated learning'
+  
+
+  # CloudWatch Log Group for S3 access logging
+  ModelBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/s3/fl-modelbucket'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ModelBucketLogs'
+
+  # SNS Topic for bucket notifications (optional)
+  ModelBucketNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-ModelBucketNotifications'
+      DisplayName: 'Federated Learning Model Bucket Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ModelBucketNotifications'
+  
+  # SNS Topic Policy to allow S3 to publish
+  ModelBucketNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ModelBucketNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToPublish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ModelBucketNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              StringLike:
+                'aws:SourceArn': !GetAtt CentralModelBucket.Arn
+
+  # Optional: CloudWatch Dashboard for monitoring
+  FederatedLearningDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-FederatedLearning-Central'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "fl-modelbucket", "StorageType", "StandardStorage" ],
+                  [ ".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Central Model Bucket Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "fl-aggregationqueue" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Aggregation Queue Activity"
+              }
+            }
+          ]
+        }
+  # Central EventBridge Bus for federated learning
+  FederatedLearningEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${EnvironmentName}-FederatedLearning-Global'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Global-EventBus'
+
+  # Lambda function that reads DynamoDB stream and publishes to EventBridge
+  DynamoDBEventPublisher:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-DynamoDBEventPublisher'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DynamoDBEventPublisherRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              eventbridge = boto3.client('events')
+              
+              print(f"Processing {len(event['Records'])} DynamoDB stream records")
+              
+              # Target regions for cross-region event distribution
+              target_regions = ["eu-west-1", "us-west-1", "us-west-2"]
+              
+              for record in event['Records']:
+                  # Create event payload with all necessary data
+                  event_detail = {
+                      'eventName': record['eventName'],
+                      'eventSource': record['eventSource'],
+                      'awsRegion': record['awsRegion'],
+                      'eventID': record['eventID'],
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'tableName': 'fl-aggregationqueue',
+                      'sourceRegion': 'eu-west-1'
+                  }
+                  
+                  # Include DynamoDB data
+                  if 'dynamodb' in record:
+                      dynamodb_data = {
+                          'Keys': record['dynamodb'].get('Keys', {}),
+                          'SizeBytes': record['dynamodb'].get('SizeBytes', 0),
+                          'SequenceNumber': record['dynamodb'].get('SequenceNumber', '')
+                      }
+                      
+                      if 'NewImage' in record['dynamodb']:
+                          dynamodb_data['NewImage'] = record['dynamodb']['NewImage']
+                      if 'OldImage' in record['dynamodb']:
+                          dynamodb_data['OldImage'] = record['dynamodb']['OldImage']
+                      
+                      event_detail['dynamodb'] = dynamodb_data
+                  
+                  # Publish to each target region
+                  for region in target_regions:
+                      try:
+                          # Create region-specific EventBridge client
+                          regional_eventbridge = boto3.client('events', region_name=region.strip())
+                          
+                          # Send event to the regional event bus
+                          response = regional_eventbridge.put_events(
+                              Entries=[
+                                  {
+                                      'Source': 'federated.learning.global',
+                                      'DetailType': 'DynamoDB Aggregation Update',
+                                      'Detail': json.dumps(event_detail),
+                                      'EventBusName': f'${EnvironmentName}-FederatedLearning',
+                                      'Resources': [
+                                          f'arn:aws:dynamodb:eu-west-1:${AWS::AccountId}:table/fl-aggregationqueue'
+                                      ]
+                                  }
+                              ]
+                          )
+                          
+                          print(f"Published event to {region}: {response}")
+                          
+                      except Exception as e:
+                          print(f"Error publishing to region {region}: {str(e)}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Events published to all regions successfully')
+              }
+      
+  DynamoDBEventPublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-DynamoDBEventPublisherRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlobalEventPublisherPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB Streams permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !GetAtt AggregationQueueTable.StreamArn
+              # Cross-region EventBridge permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: 
+                  - !Sub 'arn:aws:events:eu-west-1:${AWS::AccountId}:event-bus/${EnvironmentName}-FederatedLearning'
+                  - !Sub 'arn:aws:events:us-west-1:${AWS::AccountId}:event-bus/${EnvironmentName}-FederatedLearning'
+                  - !Sub 'arn:aws:events:us-west-2:${AWS::AccountId}:event-bus/${EnvironmentName}-FederatedLearning'
+
+  # Event Source Mapping for DynamoDB Stream
+  DynamoDBStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt AggregationQueueTable.StreamArn
+      FunctionName: !GetAtt DynamoDBEventPublisher.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+Outputs:
+  AggregationQueueName:
+    Description: Name of the DynamoDB aggregation table 
+    Value: !Ref AggregationQueueTable
+    Export:
+      Name: !Sub '${EnvironmentName}-AggregationQueue'
+  
+  AggregationQueueArn:
+    Description: ARN of the DynamoDB aggregation table 
+    Value: !GetAtt AggregationQueueTable.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-AggregationQueueArn'
+
+  AggregationQueueStreamArn:
+    Description: Stream ARN of the DynamoDB aggregation table 
+    Value: !GetAtt AggregationQueueTable.StreamArn
+    Export:
+      Name: !Sub '${EnvironmentName}-AggregationQueueStreamArn'
+
+  GlobalEventBusArn:
+    Description: ARN of the global event bus
+    Value: !GetAtt FederatedLearningEventBus.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-GlobalEventBusArn'
+
+  CentralModelBucketName:
+    Description: Name of the central model bucket
+    Value: !Ref CentralModelBucket
+    Export:
+      Name: !Sub '${EnvironmentName}-CentralModelBucket'
+  
+  CentralModelBucketArn:
+    Description: ARN of the central model bucket
+    Value: !GetAtt CentralModelBucket.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-CentralModelBucketArn'
+  
+  CentralModelBucketDomainName:
+    Description: Domain name of the central model bucket
+    Value: !GetAtt CentralModelBucket.DomainName
+    Export:
+      Name: !Sub '${EnvironmentName}-CentralModelBucketDomain'
+  
+  CentralModelBucketRegion:
+    Description: Region where the central bucket is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${EnvironmentName}-CentralModelBucketRegion'
+    
+  NotificationTopicArn:
+    Description: ARN of the SNS topic for bucket notifications
+    Value: !Ref ModelBucketNotificationTopic
+    Export:
+      Name: !Sub '${EnvironmentName}-ModelBucketNotificationTopic'

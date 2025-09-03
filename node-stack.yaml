@@ -1,0 +1,664 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Node Stack for Serverless Federated Learning System
+
+Parameters:
+  AggregatorImageURI:
+    Type: String
+    Description: 'Aggregator ECR Image URI'
+
+  InferenceImageURI:
+    Type: String
+    Description: 'Inference ECR Image URI'
+
+  ModelCopierImageURI:
+    Type: String
+    Description: 'ModelCopier ECR Image URI'
+
+  OrchestratorImageURI:
+    Type: String
+    Description: 'Orchestrator ECR Image URI'
+
+  # StreamForwarderRoleArn:
+  #   Type: String
+  #   Description: "IAM role ARN of the DynamoDB Stream forwarder Lambda (eu-west-1)."
+
+  EnvironmentName:
+    Description: Environment name prefix
+    Type: String
+    Default: fedlearn
+
+  CentralModelBucketName:
+    Description: S3 bucket name for model storage (must be globally unique)
+    Type: String
+    Default: fl-modelbucket
+
+  CentralModelBucketRegion:
+    Description: Region where the central model bucket is deployed
+    Type: String
+    Default: us-east-1
+
+  SageMakerExecutionRoleName:
+    Description: Name for SageMaker execution role
+    Type: String
+    Default: SageMakerFederatedLearningRole
+
+  UseExistingSageMakerRole:
+    Description: Set to true to use existing SageMakerExecutionRole-{region}, false to create new one
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  InstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+
+Conditions:
+  CreateNewSageMakerRole: !Equals [!Ref UseExistingSageMakerRole, 'false']
+  UseExistingRole: !Equals [!Ref UseExistingSageMakerRole, 'true']
+
+Resources: 
+
+  LocalRegionalBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-local-bucket-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-LocalRegionalBucket'
+
+  # Regional EventBridge Bus (to receive events from global stack)
+  RegionalFederatedLearningEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${EnvironmentName}-FederatedLearning'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Regional-EventBus-${AWS::Region}'
+
+  # EventBridge Rule to trigger your existing AggregatorLambda
+  AggregatorEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-AggregatorTriggerRule'
+      Description: 'Trigger aggregator Lambda when DynamoDB updates occur'
+      EventBusName: !Ref RegionalFederatedLearningEventBus
+      EventPattern:
+        source:
+          - 'federated.learning.global'
+        detail-type:
+          - 'DynamoDB Aggregation Update'
+        detail:
+          eventName:
+            - 'INSERT'
+            - 'MODIFY'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AggregatorLambda.Arn
+          Id: 'AggregatorTarget'
+
+  # Permission for EventBridge to invoke your AggregatorLambda
+  AggregatorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AggregatorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AggregatorEventRule.Arn
+
+   # Cross-Region S3 Replication Role
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-S3ReplicationRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetReplicationConfiguration'
+                  - 's3:ListBucket'
+                Resource: !Sub '${LocalRegionalBucket.Arn}'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObjectVersion'
+                  - 's3:GetObjectVersionForReplication'
+                  - 's3:GetObjectVersionAcl'
+                  - 's3:GetObjectVersionTagging'
+                Resource: !Sub '${LocalRegionalBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ReplicateObject'
+                  - 's3:ReplicateDelete'
+                  - 's3:ReplicateTags'
+                  - s3:ObjectOwnerOverrideToBucketOwner
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                Resource: 'arn:aws:s3:::fl-modelbucket/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketVersioning
+                Resource: 'arn:aws:s3:::fl-modelbucket'
+
+  # Updated IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-LambdaExecutionRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaFederatedLearningPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetObjectVersion
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CentralModelBucketName}'
+                  - !Sub 'arn:aws:s3:::${CentralModelBucketName}/*'
+                  - !Sub '${LocalRegionalBucket.Arn}'
+                  - !Sub '${LocalRegionalBucket.Arn}/*'
+              # DynamoDB Permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue
+                  - arn:aws:dynamodb:us-west-1:838814607172:table/fl-aggregationqueue
+                  - arn:aws:dynamodb:us-west-2:838814607172:table/fl-aggregationqueue
+                  # - !GetAtt AggregationQueueTable.Arn
+                  # - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AggregationQueueTable}'
+              # DynamoDB Streams
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue/stream/*
+                  # - !GetAtt AggregationQueueTable.StreamArn
+                  # - !Sub '${EnvironmentName}-AggregationQueueStreamArn'
+              # SageMaker Permissions
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DescribeEndpointConfig
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:ListEndpoints
+                  - sagemaker:ListEndpointsConfig
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:CreateProcessingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:StopTrainingJob
+                  - sagemaker:ListTrainingJobs
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:CreateModel
+                  - sagemaker:AddTags
+                  - sagemaker:DescribeModel
+                  - sagemaker:DeleteModel
+                Resource: '*'
+              # CloudWatch Logs (MISSING in original)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              # ECR Permissions for container images (MISSING in original)
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:ListImages
+                Resource: '*'
+              # IAM PassRole 
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}*"
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'sagemaker.amazonaws.com'
+              # IAM PassRole for existing SageMaker roles
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/SageMakerExecutionRole-*"
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'sagemaker.amazonaws.com'
+
+            
+  # Updated IAM Role for SageMaker
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNewSageMakerRole
+    Properties:
+      RoleName: !Sub SageMakerExecutionRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CentralModelBucketName}'
+                  - !Sub 'arn:aws:s3:::${CentralModelBucketName}/*'
+                  - !Sub '${LocalRegionalBucket.Arn}'
+                  - !Sub '${LocalRegionalBucket.Arn}/*'
+              # CloudWatch Metrics (MISSING in original)
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'cloudwatch:namespace': 
+                      - '*SageMaker*'
+                      - '*Sagemaker*'
+                      - '*sagemaker*'
+              # SageMaker Metrics (MISSING in original)
+              - Effect: Allow
+                Action:
+                  - sagemaker:BatchPutMetrics
+                  - sagemaker:BatchGetMetrics
+                Resource: '*'
+              # CloudWatch Logs (MISSING in original)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub 'arn:aws:logs:*:*:log-group:/aws/sagemaker/*'
+              # ECR Permissions (MISSING in original)
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:ListImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: 
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+
+  # Lambda Function for Inference
+  InferenceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-InferenceLambda
+      # Runtime: python3.9
+      # Timeout: 900
+      # Handler: index.lambda_handler
+      PackageType: Image
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ImageUri: !Ref InferenceImageURI
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub ${EnvironmentName}-Endpoint
+          MODEL_REGION: !Sub "${AWS::Region}"
+          AGGREGATION_TABLE: arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue
+          MODEL_REGISTRY: fl-aggregationqueue
+          MODEL_REGISTRY_REGION: eu-west-1
+          SAGEMAKER_ROLE_ARN: !If
+            - CreateNewSageMakerRole
+            - !GetAtt SageMakerExecutionRole.Arn
+            - !Sub "arn:aws:iam::${AWS::AccountId}:role/SageMakerExecutionRole-${AWS::Region}"
+          LOCAL_BUCKET: !Sub '${LocalRegionalBucket}'
+          INSTANCE_TYPE: !Ref InstanceType
+      MemorySize: 128
+      Timeout: 600
+
+  
+
+  # Lambda Function for Orchestrator
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-OrchestratorLambda
+      # Runtime: python3.9
+      # Handler: index.lambda_handler
+      PackageType: Image
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ImageUri: !Ref OrchestratorImageURI
+      Environment:
+        Variables:
+          LOCAL_BUCKET: !Sub '${LocalRegionalBucket}'
+          AGGREGATION_TABLE: arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue
+          SAGEMAKER_ROLE_ARN: !If
+            - CreateNewSageMakerRole
+            - !GetAtt SageMakerExecutionRole.Arn
+            - !Sub "arn:aws:iam::${AWS::AccountId}:role/SageMakerExecutionRole-${AWS::Region}"
+          INSTANCE_TYPE: !Ref InstanceType
+      Timeout: 60
+
+  # Lambda Function for Aggregator
+  AggregatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-AggregatorLambda
+      # Runtime: python3.9
+      # Handler: index.lambda_handler
+      PackageType: Image
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ImageUri: !Ref AggregatorImageURI
+      Environment:
+        Variables:
+          MODEL_BUCKET: fl-modelbucket
+          LOCAL_BUCKET: !Sub '${LocalRegionalBucket}'
+          REGION: !Sub '${AWS::Region}'
+          AGGREGATION_TABLE: arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue
+      Timeout: 300
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${EnvironmentName}-API
+      Description: API for federated learning inference
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  InferenceResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: inference
+
+  InferenceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref InferenceResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InferenceLambda.Arn}/invocations
+
+  # Lambda Permission for API Gateway
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InferenceLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: InferenceMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+  EdgeNodeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmazonLinuxAMIID  # Amazon Linux 2 AMI (update per region)
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet-ID-${AWS::Region}
+      IamInstanceProfile: !Ref EdgeNodeInstanceProfile
+      SecurityGroupIds:
+        - !Ref EdgeNodeSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-EdgeNode
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 curl
+          pip3 install requests
+          
+          # Create edge node script
+          cat > /home/ec2-user/edge_node.py << 'EOF'
+          import requests
+          import json
+          import time
+          import random
+          from datetime import datetime
+          
+          API_ENDPOINT = "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+          
+          def generate_data():
+              # Generate sample intrusion detection data
+              return {
+                  "data": [
+                      random.uniform(0, 100),
+                      random.uniform(0, 100),
+                      random.uniform(0, 1000),
+                      random.uniform(0, 100),
+                      random.uniform(0, 50),
+                      random.uniform(0, 100)
+                  ],
+                  "timestamp": datetime.utcnow().isoformat(),
+                  "node_id": "edge-node-${AWS::Region}"
+              }
+          
+          def main():
+              print(f"Starting edge node, sending to {API_ENDPOINT}")
+              
+              while True:
+                  try:
+                      data = generate_data()
+                      response = requests.post(
+                          f"{API_ENDPOINT}/inference",
+                          json=data,
+                          headers={"Content-Type": "application/json"}
+                      )
+                      print(f"Response: {response.status_code}")
+                  except Exception as e:
+                      print(f"Error: {e}")
+                  
+                  time.sleep(random.uniform(1, 5))
+          
+          if __name__ == "__main__":
+              main()
+          EOF
+          
+          # Run the edge node
+          # python3 /home/ec2-user/edge_node.py 
+
+  EdgeNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow basic inbound access for edge node
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID-${AWS::Region}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-EdgeNodeSG
+
+  EdgeNodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-EdgeNodeRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  EdgeNodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${EnvironmentName}-EdgeNodeInstanceProfile-${AWS::Region}
+      Roles:
+        - !Ref EdgeNodeInstanceRole
+
+  # EventBridge Rule to trigger on SageMaker training job completion
+  ModelCopyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-ModelCopyRule'
+      Description: 'Trigger model copy when SageMaker training completes'
+      EventPattern:
+        source:
+          - 'aws.sagemaker'
+        detail-type:
+          - 'SageMaker Training Job State Change'
+        detail:
+          TrainingJobStatus:
+            - 'Completed'
+          TrainingJobName:
+            - prefix: 'federated-training'  # Only your federated learning jobs
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelCopyLambda.Arn
+          Id: 'ModelCopyTarget'
+
+  # Lambda function to copy model immediately to central bucket
+  ModelCopyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-ModelCopy'
+      # Runtime: python3.9
+      # Handler: index.lambda_handler
+      PackageType: Image
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+       ImageUri: !Ref ModelCopierImageURI
+      Environment:
+        Variables:
+          CENTRAL_BUCKET: !Ref CentralModelBucketName
+          LOCAL_BUCKET: !Ref LocalRegionalBucket
+          AGGREGATION_TABLE_NAME: arn:aws:dynamodb:eu-west-1:838814607172:table/fl-aggregationqueue
+          MODEL_REGISTRY_REGION: eu-west-1
+
+  # Permission for EventBridge to invoke Lambda
+  ModelCopyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModelCopyLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelCopyEventRule.Arn
+Outputs:
+  ApiGatewayUrl:
+    Description: URL of the API Gateway
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${EnvironmentName}-ApiGatewayUrl
+
+  LambdaExecutionRoleArn:
+    Description: ARN of Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-LambdaExecutionRoleArn
+
+  SageMakerExecutionRoleArn:
+    Description: ARN of SageMaker execution role
+    Value: !If
+      - CreateNewSageMakerRole
+      - !GetAtt SageMakerExecutionRole.Arn
+      - !Sub "arn:aws:iam::${AWS::AccountId}:role/SageMakerExecutionRole-${AWS::Region}"
+    Export:
+      Name: !Sub ${EnvironmentName}-SageMakerExecutionRoleArn
+  
+  OrchestratorLambdaArn:
+    Description: ARN of Orchestrator Lambda
+    Value: !GetAtt OrchestratorLambda.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-OrchestratorLambdaArn
+  
+  EdgeNodeInstanceId:
+    Description: Instance ID of the edge node
+    Value: !Ref EdgeNodeInstance
+    Export:
+      Name: !Sub ${EnvironmentName}-EdgeNodeInstanceId
+  
+  S3ReplicationRoleArn:
+    Description: Role assumed by S3 for replication
+    Value: !GetAtt S3ReplicationRole.Arn
